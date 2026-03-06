@@ -3,23 +3,31 @@ import json
 import time
 from flask import Flask, request
 import requests
+import sys
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = '8518993595:AAGuZ7NIW_FRuThokONbn1O4KZHn5VOprmE'
 TELEGRAM_CHAT_ID = '5223827419'
-WALLETS_FILE = 'wallets.json'
 SOLANA_RPC_URL = "https://solana-mainnet.g.alchemy.com/v2/VdMiCdsw9fyieYfs-JwSW"
 
-# Fixed Pricing IDs for CoinGecko
+# Robust Cloud Folder Pathing
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WALLETS_FILE = os.path.join(BASE_DIR, 'wallets.json')
+
+COMMON_TOKENS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
+    "So11111111111111111111111111111111111111112": "WSOL",
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": "BONK",
+    "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk": "WEN",
+    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbAbdRhAwapKE": "JUP"
+}
+
 COINGECKO_IDS = {
-    "ETH": "ethereum",
-    "SOL": "solana",
-    "USDC": "usd-coin",
-    "USDT": "tether",
-    "BONK": "bonk",
-    "JUP": "jupiter-exchange-solana"
+    "ETH": "ethereum", "SOL": "solana", "USDC": "usd-coin",
+    "USDT": "tether", "BONK": "bonk", "JUP": "jupiter-exchange-solana"
 }
 
 PROCESSED_TXS = []
@@ -33,13 +41,15 @@ def get_fiat_value(symbol, amount):
         if cg_id in res:
             usd = res[cg_id].get('usd', 0) * abs(amount)
             inr = res[cg_id].get('inr', 0) * abs(amount)
+            if usd < 0.01: return ""
             return f" <i>($ {usd:,.2f} | ₹ {inr:,.0f})</i>"
         return ""
     except: return ""
 
 def load_wallets():
     if os.path.exists(WALLETS_FILE):
-        with open(WALLETS_FILE, 'r') as f: return json.load(f)
+        with open(WALLETS_FILE, 'r') as f:
+            return json.load(f)
     return {}
 
 def format_wallet(address, wallets):
@@ -68,7 +78,7 @@ def webhook():
             
             asset = tx.get('asset', 'ETH')
             val = tx.get('value', 0)
-            if val < 0.001: continue # Skip dust
+            if val < 0.0001: continue
             
             fiat = get_fiat_value(asset, val)
             msg = (f"🔵 <b>ETH MOVEMENT</b> 🔵\n\n"
@@ -86,34 +96,79 @@ def webhook():
             if not sig or sig in PROCESSED_TXS: continue
             PROCESSED_TXS.append(sig)
             
-            print(f"🚨 [TRIPWIRE] {sig}")
-            time.sleep(2) # Wait for blockchain update
+            print(f"🚨 [TRIPWIRE] {sig}", flush=True)
             
-            res = requests.post(SOLANA_RPC_URL, json={
-                "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-                "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-            }).json().get('result')
+            res = None
+            for i in range(5):
+                time.sleep(2)
+                try:
+                    response = requests.post(SOLANA_RPC_URL, json={
+                        "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                        "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                    }).json()
+                    res = response.get('result')
+                    if res: break
+                except: pass
 
             if not res: continue
-            meta = res.get('meta', {})
             
-            # Identify which tracked wallet is involved
+            meta = res.get('meta', {})
             keys = res.get('transaction', {}).get('message', {}).get('accountKeys', [])
-            tracked = next((k.get('pubkey') if isinstance(k, dict) else k for k in keys if (k.get('pubkey') if isinstance(k, dict) else k) in wallets), None)
+            
+            tracked = None
+            for k in keys:
+                pk = k.get('pubkey') if isinstance(k, dict) else k
+                if pk in wallets:
+                    tracked = pk
+                    break
             
             if tracked:
-                # Calculate SOL Change
+                changes_detected = []
+                token_balances = {}
+
+                # 1. Native SOL Math
                 idx = next(i for i, k in enumerate(keys) if (k.get('pubkey') if isinstance(k, dict) else k) == tracked)
-                change = (meta.get('postBalances', [])[idx] - meta.get('preBalances', [])[idx]) / 1e9
+                pre_sol = meta.get('preBalances', [])[idx]
+                post_sol = meta.get('postBalances', [])[idx]
+                sol_change = (post_sol - pre_sol) / 1e9
                 
-                if abs(change) > 0.01:
-                    fiat = get_fiat_value("SOL", change)
-                    msg = (f"🟣 <b>SOL MOVEMENT</b> 🟣\n\n"
-                           f"🎯 Wallet: <b>{wallets[tracked]}</b>\n"
-                           f"⚡ Change: {change:+.4f} SOL{fiat}")
-                    kb = {"inline_keyboard": [[{"text": "🔍 Solscan", "url": f"https://solscan.io/tx/{sig}"}]]}
-                    send_telegram(msg, kb)
+                if abs(sol_change) > 0.005:
+                    fiat = get_fiat_value("SOL", sol_change)
+                    sign = "+" if sol_change > 0 else ""
+                    changes_detected.append(f"<b>Native SOL:</b> {sign}{sol_change:.4f} SOL{fiat}")
+
+                # 2. Token Math (RESTORED!)
+                pre_tokens = meta.get('preTokenBalances', [])
+                post_tokens = meta.get('postTokenBalances', [])
+                
+                for bal in pre_tokens:
+                    if bal.get('owner') == tracked:
+                        amt = bal.get('uiTokenAmount', {}).get('uiAmount') or 0
+                        token_balances[bal.get('mint')] = -amt
+                        
+                for bal in post_tokens:
+                    if bal.get('owner') == tracked:
+                        amt = bal.get('uiTokenAmount', {}).get('uiAmount') or 0
+                        mint = bal.get('mint')
+                        token_balances[mint] = token_balances.get(mint, 0) + amt
+
+                for mint, change in token_balances.items():
+                    if abs(change) > 0.0001:
+                        sign = "+" if change > 0 else ""
+                        token_name = COMMON_TOKENS.get(mint, f"Token ({mint[:4]}...{mint[-4:]})")
+                        fiat = get_fiat_value(token_name, change)
+                        changes_detected.append(f"<b>Token:</b> {sign}{change:,.2f} {token_name}{fiat}")
+
+                if changes_detected:
+                    action_text = "\n".join(changes_detected)
+                    msg = (f"🟣 <b>SOL WHALE ACTIVITY</b> 🟣\n\n"
+                           f"🎯 <b>Wallet:</b> <b>{wallets[tracked]}</b>\n\n"
+                           f"⚡ <b>Balance Changes:</b>\n{action_text}")
                     
+                    kb = {"inline_keyboard": [[{"text": "🔍 View on Solscan", "url": f"https://solscan.io/tx/{sig}"}]]}
+                    send_telegram(msg, kb)
+                    print(f"✅ TG Alert Sent!", flush=True)
+
     if len(PROCESSED_TXS) > 200: PROCESSED_TXS.pop(0)
     return "OK", 200
 
