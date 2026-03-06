@@ -30,7 +30,7 @@ COINGECKO_IDS = {
 }
 
 PROCESSED_TXS = []
-HL_LAST_TIMESTAMPS = {} # Hyperliquid Spy Memory
+HL_LAST_TIMESTAMPS = {}
 
 def get_fiat_value(symbol, amount):
     cg_id = COINGECKO_IDS.get(symbol)
@@ -54,8 +54,7 @@ def load_wallets():
     for path in paths_to_try:
         if os.path.exists(path):
             with open(path, 'r') as f:
-                data = json.load(f)
-                return data
+                return json.load(f)
     return {}
 
 def format_wallet(address, wallets):
@@ -68,14 +67,13 @@ def send_telegram(msg, markup=None):
     if markup: payload["reply_markup"] = markup
     requests.post(url, json=payload)
 
-# --- BRAIN 2: THE HYPERLIQUID SPY (Runs in background) ---
+# --- BRAIN 2: HYPERLIQUID SPY ---
 def hyperliquid_spy():
     print("🕵️‍♂️ Hyperliquid Spy Thread Started!", flush=True)
     while True:
         try:
             wallets = load_wallets()
             for address, name in wallets.items():
-                # Hyperliquid only uses EVM-style (0x) addresses
                 if not address.startswith("0x"): 
                     continue
                 
@@ -83,20 +81,16 @@ def hyperliquid_spy():
                 payload = {"type": "userFills", "user": address}
                 res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=5).json()
                 
-                # Skip if wallet hasn't traded or returns an error
                 if not isinstance(res, list) or len(res) == 0:
                     continue
                 
-                # Check the 5 most recent trades
                 for fill in reversed(res[:5]): 
                     fill_time = fill.get("time", 0)
                     
-                    # If this is the bot's first time seeing this wallet, just memorize the time and skip alerting
                     if address not in HL_LAST_TIMESTAMPS:
                         HL_LAST_TIMESTAMPS[address] = fill_time
                         continue 
                     
-                    # If the trade is newer than our memory, we caught a live one!
                     if fill_time > HL_LAST_TIMESTAMPS[address]:
                         HL_LAST_TIMESTAMPS[address] = fill_time
                         
@@ -106,7 +100,6 @@ def hyperliquid_spy():
                         px = fill.get("px", "0")
                         pnl = fill.get("closedPnl", "0")
                         
-                        # Only show PnL if they are closing a position
                         pnl_str = f"\n💸 <b>Realized PnL:</b> ${float(pnl):,.2f}" if float(pnl) != 0 else ""
                         
                         msg = (f"🌊 <b>HYPERLIQUID WHALE</b> 🌊\n\n"
@@ -115,17 +108,23 @@ def hyperliquid_spy():
                                f"💰 <b>Price:</b> ${float(px):,.4f}{pnl_str}")
                                
                         kb = {"inline_keyboard": [[{"text": "📊 View HL Profile", "url": f"https://app.hyperliquid.xyz/explorer/address/{address}"}]]}
-                        
                         send_telegram(msg, kb)
                         print(f"✅ HL Alert Sent for {name}!", flush=True)
                         
-            # Sleep 15 seconds to stay safely under Hyperliquid's rate limits
             time.sleep(15) 
         except Exception as e:
-            print(f"⚠️ HL Spy Error: {e}", flush=True)
             time.sleep(15)
 
-# --- BRAIN 1: THE ALCHEMY BUTLER (Runs the Webhook) ---
+# --- START THE SPY THREAD FOR CLOUD DEPLOYMENTS ---
+# Placing this OUTSIDE the main block so Gunicorn catches it instantly
+threading.Thread(target=hyperliquid_spy, daemon=True).start()
+
+# --- BRAIN 1: TELEGRAM & ALCHEMY DOORS ---
+@app.route('/telegram', methods=['POST'])
+def handle_telegram():
+    # Restored Telegram Door to prevent 404 errors!
+    return "OK", 200
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     global PROCESSED_TXS
@@ -133,7 +132,6 @@ def webhook():
     event = data.get('event', {})
     wallets = load_wallets()
 
-    # --- ETH HANDLING ---
     if 'activity' in event:
         for tx in event['activity']:
             tx_hash = tx.get('hash')
@@ -153,7 +151,6 @@ def webhook():
             kb = {"inline_keyboard": [[{"text": "🔍 Etherscan", "url": f"https://etherscan.io/tx/{tx_hash}"}]]}
             send_telegram(msg, kb)
 
-    # --- SOL HANDLING ---
     elif 'transaction' in event:
         for tx in event['transaction']:
             sig = tx.get('signature')
@@ -182,7 +179,6 @@ def webhook():
             tracked = None
             tracked_idx = None
             
-            # 1. Main Keys
             for i, k in enumerate(keys):
                 pk = k.get('pubkey') if isinstance(k, dict) else k
                 if pk in wallets:
@@ -190,7 +186,6 @@ def webhook():
                     tracked_idx = i
                     break
             
-            # 2. Token Owners
             if not tracked:
                 all_bals = meta.get('preTokenBalances', []) + meta.get('postTokenBalances', [])
                 for bal in all_bals:
@@ -247,8 +242,4 @@ def webhook():
     return "OK", 200
 
 if __name__ == '__main__':
-    # Wake up the Spy Thread in the background
-    threading.Thread(target=hyperliquid_spy, daemon=True).start()
-    
-    # Start the Webhook server
     app.run(port=10000)
