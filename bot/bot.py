@@ -32,6 +32,7 @@ COINGECKO_IDS = {
 PROCESSED_TXS = []
 HL_LAST_TIMESTAMPS = {}
 
+# --- HELPER FUNCTIONS ---
 def get_fiat_value(symbol, amount):
     cg_id = COINGECKO_IDS.get(symbol)
     if not cg_id: return ""
@@ -67,7 +68,7 @@ def send_telegram(msg, markup=None):
     if markup: payload["reply_markup"] = markup
     requests.post(url, json=payload)
 
-# --- BRAIN 2: HYPERLIQUID SPY ---
+# --- BRAIN 2: HYPERLIQUID SPY (Background Thread) ---
 def hyperliquid_spy():
     print("🕵️‍♂️ Hyperliquid Spy Thread Started!", flush=True)
     while True:
@@ -94,20 +95,35 @@ def hyperliquid_spy():
                     if fill_time > HL_LAST_TIMESTAMPS[address]:
                         HL_LAST_TIMESTAMPS[address] = fill_time
                         
-                        coin = fill.get("coin", "UNKNOWN")
+                        # Premium UI Formatting
+                        raw_coin = fill.get("coin", "UNKNOWN")
+                        coin = raw_coin.replace("xyz:", "") # Clean up testnet/spot names
                         dir_str = fill.get("dir", "Trade")
-                        sz = fill.get("sz", "0")
-                        px = fill.get("px", "0")
-                        pnl = fill.get("closedPnl", "0")
                         
-                        pnl_str = f"\n💸 <b>Realized PnL:</b> ${float(pnl):,.2f}" if float(pnl) != 0 else ""
+                        sz = float(fill.get("sz", "0"))
+                        px = float(fill.get("px", "0"))
+                        pnl = float(fill.get("closedPnl", "0"))
+                        notional_value = sz * px
+                        
+                        # Color coding
+                        action_emoji = "⚡"
+                        if "Long" in dir_str or "Buy" in dir_str: action_emoji = "🟢"
+                        elif "Short" in dir_str or "Sell" in dir_str: action_emoji = "🔴"
+                        elif "Close" in dir_str: action_emoji = "🟡"
+                        
+                        pnl_str = f"\n💸 <b>Realized PnL:</b> ${pnl:,.2f}" if pnl != 0 else ""
                         
                         msg = (f"🌊 <b>HYPERLIQUID WHALE</b> 🌊\n\n"
                                f"🎯 <b>Wallet:</b> <b>{name}</b>\n"
-                               f"⚡ <b>Action:</b> {dir_str} {sz} {coin}\n"
-                               f"💰 <b>Price:</b> ${float(px):,.4f}{pnl_str}")
+                               f"{action_emoji} <b>Action:</b> {dir_str}\n"
+                               f"🪙 <b>Asset:</b> {coin}\n"
+                               f"⚖️ <b>Size:</b> {sz:,.4f} <i>(${notional_value:,.2f})</i>\n"
+                               f"💰 <b>Price:</b> ${px:,.4f}{pnl_str}")
                                
-                        kb = {"inline_keyboard": [[{"text": "📊 View HL Profile", "url": f"https://app.hyperliquid.xyz/explorer/address/{address}"}]]}
+                        kb = {"inline_keyboard": [
+                            [{"text": f"📈 Trade {coin} on HL", "url": f"https://app.hyperliquid.xyz/trade/{raw_coin}"}],
+                            [{"text": "📊 View HL Profile", "url": f"https://app.hyperliquid.xyz/explorer/address/{address}"}]
+                        ]}
                         send_telegram(msg, kb)
                         print(f"✅ HL Alert Sent for {name}!", flush=True)
                         
@@ -115,14 +131,12 @@ def hyperliquid_spy():
         except Exception as e:
             time.sleep(15)
 
-# --- START THE SPY THREAD FOR CLOUD DEPLOYMENTS ---
-# Placing this OUTSIDE the main block so Gunicorn catches it instantly
+# Start the Spy Thread instantly so Gunicorn picks it up
 threading.Thread(target=hyperliquid_spy, daemon=True).start()
 
-# --- BRAIN 1: TELEGRAM & ALCHEMY DOORS ---
+# --- BRAIN 1: FLASK WEBHOOKS (Telegram & Alchemy) ---
 @app.route('/telegram', methods=['POST'])
 def handle_telegram():
-    # Restored Telegram Door to prevent 404 errors!
     return "OK", 200
 
 @app.route('/webhook', methods=['POST'])
@@ -132,6 +146,7 @@ def webhook():
     event = data.get('event', {})
     wallets = load_wallets()
 
+    # ETHEREUM HANDLING
     if 'activity' in event:
         for tx in event['activity']:
             tx_hash = tx.get('hash')
@@ -151,6 +166,7 @@ def webhook():
             kb = {"inline_keyboard": [[{"text": "🔍 Etherscan", "url": f"https://etherscan.io/tx/{tx_hash}"}]]}
             send_telegram(msg, kb)
 
+    # SOLANA HANDLING
     elif 'transaction' in event:
         for tx in event['transaction']:
             sig = tx.get('signature')
