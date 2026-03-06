@@ -45,7 +45,6 @@ def get_fiat_value(symbol, amount):
     except: return ""
 
 def load_wallets():
-    # Try the current /bot folder, then try the main root folder
     paths_to_try = [
         os.path.join(BASE_DIR, 'wallets.json'),
         os.path.join(os.path.dirname(BASE_DIR), 'wallets.json')
@@ -126,30 +125,45 @@ def webhook():
             keys = res.get('transaction', {}).get('message', {}).get('accountKeys', [])
             
             tracked = None
-            for k in keys:
+            tracked_idx = None
+            
+            # 1. Look in main account keys (For Native SOL / Signers)
+            for i, k in enumerate(keys):
                 pk = k.get('pubkey') if isinstance(k, dict) else k
                 if pk in wallets:
                     tracked = pk
+                    tracked_idx = i
                     break
             
+            # 2. NEW DEEP SCAN: Look in Token Owners (For incoming Token transfers!)
             if not tracked:
-                print(f"🛑 Ignored: Transaction found, but tracked wallet was NOT in the receipt. Keys present: {len(keys)}", flush=True)
+                all_bals = meta.get('preTokenBalances', []) + meta.get('postTokenBalances', [])
+                for bal in all_bals:
+                    owner = bal.get('owner')
+                    if owner in wallets:
+                        tracked = owner
+                        break
+
+            if not tracked:
+                print(f"🛑 Ignored: Tracked wallet not found in keys OR token metadata.", flush=True)
                 continue
             
-            print(f"🎯 Target locked: {tracked}", flush=True)
+            print(f"🎯 Target locked via Deep Scan: {tracked}", flush=True)
             changes_detected = []
             token_balances = {}
 
-            idx = next(i for i, k in enumerate(keys) if (k.get('pubkey') if isinstance(k, dict) else k) == tracked)
-            pre_sol = meta.get('preBalances', [])[idx]
-            post_sol = meta.get('postBalances', [])[idx]
-            sol_change = (post_sol - pre_sol) / 1e9
-            
-            if abs(sol_change) > 0.005:
-                fiat = get_fiat_value("SOL", sol_change)
-                sign = "+" if sol_change > 0 else ""
-                changes_detected.append(f"<b>Native SOL:</b> {sign}{sol_change:.4f} SOL{fiat}")
+            # Native SOL Math (Only works if wallet was in the main keys)
+            if tracked_idx is not None:
+                pre_sol = meta.get('preBalances', [])[tracked_idx]
+                post_sol = meta.get('postBalances', [])[tracked_idx]
+                sol_change = (post_sol - pre_sol) / 1e9
+                
+                if abs(sol_change) > 0.005:
+                    fiat = get_fiat_value("SOL", sol_change)
+                    sign = "+" if sol_change > 0 else ""
+                    changes_detected.append(f"<b>Native SOL:</b> {sign}{sol_change:.4f} SOL{fiat}")
 
+            # Token Math
             pre_tokens = meta.get('preTokenBalances', [])
             post_tokens = meta.get('postTokenBalances', [])
             
@@ -181,7 +195,7 @@ def webhook():
                 send_telegram(msg, kb)
                 print(f"✅ TG Alert Sent Successfully!", flush=True)
             else:
-                print(f"🛑 Ignored: No significant token changes found (gas fee dust).", flush=True)
+                print(f"🛑 Ignored: No significant token changes found.", flush=True)
 
     if len(PROCESSED_TXS) > 200: PROCESSED_TXS.pop(0)
     return "OK", 200
