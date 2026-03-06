@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import threading
 from flask import Flask, request
 import requests
 import sys
@@ -29,6 +30,7 @@ COINGECKO_IDS = {
 }
 
 PROCESSED_TXS = []
+HL_LAST_TIMESTAMPS = {} # Hyperliquid Spy Memory
 
 def get_fiat_value(symbol, amount):
     cg_id = COINGECKO_IDS.get(symbol)
@@ -53,10 +55,7 @@ def load_wallets():
         if os.path.exists(path):
             with open(path, 'r') as f:
                 data = json.load(f)
-                print(f"✅ Loaded {len(data)} wallets from {path}", flush=True)
                 return data
-                
-    print(f"❌ CRITICAL ERROR: Could not find wallets.json anywhere!", flush=True)
     return {}
 
 def format_wallet(address, wallets):
@@ -69,6 +68,64 @@ def send_telegram(msg, markup=None):
     if markup: payload["reply_markup"] = markup
     requests.post(url, json=payload)
 
+# --- BRAIN 2: THE HYPERLIQUID SPY (Runs in background) ---
+def hyperliquid_spy():
+    print("🕵️‍♂️ Hyperliquid Spy Thread Started!", flush=True)
+    while True:
+        try:
+            wallets = load_wallets()
+            for address, name in wallets.items():
+                # Hyperliquid only uses EVM-style (0x) addresses
+                if not address.startswith("0x"): 
+                    continue
+                
+                url = "https://api.hyperliquid.xyz/info"
+                payload = {"type": "userFills", "user": address}
+                res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=5).json()
+                
+                # Skip if wallet hasn't traded or returns an error
+                if not isinstance(res, list) or len(res) == 0:
+                    continue
+                
+                # Check the 5 most recent trades
+                for fill in reversed(res[:5]): 
+                    fill_time = fill.get("time", 0)
+                    
+                    # If this is the bot's first time seeing this wallet, just memorize the time and skip alerting
+                    if address not in HL_LAST_TIMESTAMPS:
+                        HL_LAST_TIMESTAMPS[address] = fill_time
+                        continue 
+                    
+                    # If the trade is newer than our memory, we caught a live one!
+                    if fill_time > HL_LAST_TIMESTAMPS[address]:
+                        HL_LAST_TIMESTAMPS[address] = fill_time
+                        
+                        coin = fill.get("coin", "UNKNOWN")
+                        dir_str = fill.get("dir", "Trade")
+                        sz = fill.get("sz", "0")
+                        px = fill.get("px", "0")
+                        pnl = fill.get("closedPnl", "0")
+                        
+                        # Only show PnL if they are closing a position
+                        pnl_str = f"\n💸 <b>Realized PnL:</b> ${float(pnl):,.2f}" if float(pnl) != 0 else ""
+                        
+                        msg = (f"🌊 <b>HYPERLIQUID WHALE</b> 🌊\n\n"
+                               f"🎯 <b>Wallet:</b> <b>{name}</b>\n"
+                               f"⚡ <b>Action:</b> {dir_str} {sz} {coin}\n"
+                               f"💰 <b>Price:</b> ${float(px):,.4f}{pnl_str}")
+                               
+                        kb = {"inline_keyboard": [[{"text": "📊 View HL Profile", "url": f"https://app.hyperliquid.xyz/explorer/address/{address}"}]]}
+                        
+                        send_telegram(msg, kb)
+                        print(f"✅ HL Alert Sent for {name}!", flush=True)
+                        
+            # Sleep 15 seconds to stay safely under Hyperliquid's rate limits
+            time.sleep(15) 
+        except Exception as e:
+            print(f"⚠️ HL Spy Error: {e}", flush=True)
+            time.sleep(15)
+
+# --- BRAIN 1: THE ALCHEMY BUTLER (Runs the Webhook) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     global PROCESSED_TXS
@@ -117,9 +174,7 @@ def webhook():
                     if res: break
                 except: pass
 
-            if not res: 
-                print("🛑 Gave up waiting for blockchain receipt.", flush=True)
-                continue
+            if not res: continue
             
             meta = res.get('meta', {})
             keys = res.get('transaction', {}).get('message', {}).get('accountKeys', [])
@@ -127,7 +182,7 @@ def webhook():
             tracked = None
             tracked_idx = None
             
-            # 1. Look in main account keys (For Native SOL / Signers)
+            # 1. Main Keys
             for i, k in enumerate(keys):
                 pk = k.get('pubkey') if isinstance(k, dict) else k
                 if pk in wallets:
@@ -135,7 +190,7 @@ def webhook():
                     tracked_idx = i
                     break
             
-            # 2. NEW DEEP SCAN: Look in Token Owners (For incoming Token transfers!)
+            # 2. Token Owners
             if not tracked:
                 all_bals = meta.get('preTokenBalances', []) + meta.get('postTokenBalances', [])
                 for bal in all_bals:
@@ -144,26 +199,20 @@ def webhook():
                         tracked = owner
                         break
 
-            if not tracked:
-                print(f"🛑 Ignored: Tracked wallet not found in keys OR token metadata.", flush=True)
-                continue
+            if not tracked: continue
             
-            print(f"🎯 Target locked via Deep Scan: {tracked}", flush=True)
             changes_detected = []
             token_balances = {}
 
-            # Native SOL Math (Only works if wallet was in the main keys)
             if tracked_idx is not None:
                 pre_sol = meta.get('preBalances', [])[tracked_idx]
                 post_sol = meta.get('postBalances', [])[tracked_idx]
                 sol_change = (post_sol - pre_sol) / 1e9
-                
                 if abs(sol_change) > 0.005:
                     fiat = get_fiat_value("SOL", sol_change)
                     sign = "+" if sol_change > 0 else ""
                     changes_detected.append(f"<b>Native SOL:</b> {sign}{sol_change:.4f} SOL{fiat}")
 
-            # Token Math
             pre_tokens = meta.get('preTokenBalances', [])
             post_tokens = meta.get('postTokenBalances', [])
             
@@ -193,12 +242,13 @@ def webhook():
                 
                 kb = {"inline_keyboard": [[{"text": "🔍 View on Solscan", "url": f"https://solscan.io/tx/{sig}"}]]}
                 send_telegram(msg, kb)
-                print(f"✅ TG Alert Sent Successfully!", flush=True)
-            else:
-                print(f"🛑 Ignored: No significant token changes found.", flush=True)
 
     if len(PROCESSED_TXS) > 200: PROCESSED_TXS.pop(0)
     return "OK", 200
 
 if __name__ == '__main__':
+    # Wake up the Spy Thread in the background
+    threading.Thread(target=hyperliquid_spy, daemon=True).start()
+    
+    # Start the Webhook server
     app.run(port=10000)
