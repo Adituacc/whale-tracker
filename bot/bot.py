@@ -12,9 +12,7 @@ TELEGRAM_BOT_TOKEN = '8518993595:AAGuZ7NIW_FRuThokONbn1O4KZHn5VOprmE'
 TELEGRAM_CHAT_ID = '5223827419'
 SOLANA_RPC_URL = "https://solana-mainnet.g.alchemy.com/v2/VdMiCdsw9fyieYfs-JwSW"
 
-# Robust Cloud Folder Pathing
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-WALLETS_FILE = os.path.join(BASE_DIR, 'wallets.json')
 
 COMMON_TOKENS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
@@ -47,9 +45,19 @@ def get_fiat_value(symbol, amount):
     except: return ""
 
 def load_wallets():
-    if os.path.exists(WALLETS_FILE):
-        with open(WALLETS_FILE, 'r') as f:
-            return json.load(f)
+    # Try the current /bot folder, then try the main root folder
+    paths_to_try = [
+        os.path.join(BASE_DIR, 'wallets.json'),
+        os.path.join(os.path.dirname(BASE_DIR), 'wallets.json')
+    ]
+    for path in paths_to_try:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+                print(f"✅ Loaded {len(data)} wallets from {path}", flush=True)
+                return data
+                
+    print(f"❌ CRITICAL ERROR: Could not find wallets.json anywhere!", flush=True)
     return {}
 
 def format_wallet(address, wallets):
@@ -96,7 +104,7 @@ def webhook():
             if not sig or sig in PROCESSED_TXS: continue
             PROCESSED_TXS.append(sig)
             
-            print(f"🚨 [TRIPWIRE] {sig}", flush=True)
+            print(f"🚨 [TRIPWIRE TRIGGERED] {sig}", flush=True)
             
             res = None
             for i in range(5):
@@ -110,7 +118,9 @@ def webhook():
                     if res: break
                 except: pass
 
-            if not res: continue
+            if not res: 
+                print("🛑 Gave up waiting for blockchain receipt.", flush=True)
+                continue
             
             meta = res.get('meta', {})
             keys = res.get('transaction', {}).get('message', {}).get('accountKeys', [])
@@ -122,52 +132,56 @@ def webhook():
                     tracked = pk
                     break
             
-            if tracked:
-                changes_detected = []
-                token_balances = {}
+            if not tracked:
+                print(f"🛑 Ignored: Transaction found, but tracked wallet was NOT in the receipt. Keys present: {len(keys)}", flush=True)
+                continue
+            
+            print(f"🎯 Target locked: {tracked}", flush=True)
+            changes_detected = []
+            token_balances = {}
 
-                # 1. Native SOL Math
-                idx = next(i for i, k in enumerate(keys) if (k.get('pubkey') if isinstance(k, dict) else k) == tracked)
-                pre_sol = meta.get('preBalances', [])[idx]
-                post_sol = meta.get('postBalances', [])[idx]
-                sol_change = (post_sol - pre_sol) / 1e9
-                
-                if abs(sol_change) > 0.005:
-                    fiat = get_fiat_value("SOL", sol_change)
-                    sign = "+" if sol_change > 0 else ""
-                    changes_detected.append(f"<b>Native SOL:</b> {sign}{sol_change:.4f} SOL{fiat}")
+            idx = next(i for i, k in enumerate(keys) if (k.get('pubkey') if isinstance(k, dict) else k) == tracked)
+            pre_sol = meta.get('preBalances', [])[idx]
+            post_sol = meta.get('postBalances', [])[idx]
+            sol_change = (post_sol - pre_sol) / 1e9
+            
+            if abs(sol_change) > 0.005:
+                fiat = get_fiat_value("SOL", sol_change)
+                sign = "+" if sol_change > 0 else ""
+                changes_detected.append(f"<b>Native SOL:</b> {sign}{sol_change:.4f} SOL{fiat}")
 
-                # 2. Token Math (RESTORED!)
-                pre_tokens = meta.get('preTokenBalances', [])
-                post_tokens = meta.get('postTokenBalances', [])
-                
-                for bal in pre_tokens:
-                    if bal.get('owner') == tracked:
-                        amt = bal.get('uiTokenAmount', {}).get('uiAmount') or 0
-                        token_balances[bal.get('mint')] = -amt
-                        
-                for bal in post_tokens:
-                    if bal.get('owner') == tracked:
-                        amt = bal.get('uiTokenAmount', {}).get('uiAmount') or 0
-                        mint = bal.get('mint')
-                        token_balances[mint] = token_balances.get(mint, 0) + amt
-
-                for mint, change in token_balances.items():
-                    if abs(change) > 0.0001:
-                        sign = "+" if change > 0 else ""
-                        token_name = COMMON_TOKENS.get(mint, f"Token ({mint[:4]}...{mint[-4:]})")
-                        fiat = get_fiat_value(token_name, change)
-                        changes_detected.append(f"<b>Token:</b> {sign}{change:,.2f} {token_name}{fiat}")
-
-                if changes_detected:
-                    action_text = "\n".join(changes_detected)
-                    msg = (f"🟣 <b>SOL WHALE ACTIVITY</b> 🟣\n\n"
-                           f"🎯 <b>Wallet:</b> <b>{wallets[tracked]}</b>\n\n"
-                           f"⚡ <b>Balance Changes:</b>\n{action_text}")
+            pre_tokens = meta.get('preTokenBalances', [])
+            post_tokens = meta.get('postTokenBalances', [])
+            
+            for bal in pre_tokens:
+                if bal.get('owner') == tracked:
+                    amt = bal.get('uiTokenAmount', {}).get('uiAmount') or 0
+                    token_balances[bal.get('mint')] = -amt
                     
-                    kb = {"inline_keyboard": [[{"text": "🔍 View on Solscan", "url": f"https://solscan.io/tx/{sig}"}]]}
-                    send_telegram(msg, kb)
-                    print(f"✅ TG Alert Sent!", flush=True)
+            for bal in post_tokens:
+                if bal.get('owner') == tracked:
+                    amt = bal.get('uiTokenAmount', {}).get('uiAmount') or 0
+                    mint = bal.get('mint')
+                    token_balances[mint] = token_balances.get(mint, 0) + amt
+
+            for mint, change in token_balances.items():
+                if abs(change) > 0.0001:
+                    sign = "+" if change > 0 else ""
+                    token_name = COMMON_TOKENS.get(mint, f"Token ({mint[:4]}...{mint[-4:]})")
+                    fiat = get_fiat_value(token_name, change)
+                    changes_detected.append(f"<b>Token:</b> {sign}{change:,.2f} {token_name}{fiat}")
+
+            if changes_detected:
+                action_text = "\n".join(changes_detected)
+                msg = (f"🟣 <b>SOL WHALE ACTIVITY</b> 🟣\n\n"
+                       f"🎯 <b>Wallet:</b> <b>{wallets[tracked]}</b>\n\n"
+                       f"⚡ <b>Balance Changes:</b>\n{action_text}")
+                
+                kb = {"inline_keyboard": [[{"text": "🔍 View on Solscan", "url": f"https://solscan.io/tx/{sig}"}]]}
+                send_telegram(msg, kb)
+                print(f"✅ TG Alert Sent Successfully!", flush=True)
+            else:
+                print(f"🛑 Ignored: No significant token changes found (gas fee dust).", flush=True)
 
     if len(PROCESSED_TXS) > 200: PROCESSED_TXS.pop(0)
     return "OK", 200
